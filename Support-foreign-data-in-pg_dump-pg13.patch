@@ -1,0 +1,630 @@
+diff --git a/doc/src/sgml/ref/pg_dump.sgml b/doc/src/sgml/ref/pg_dump.sgml
+index 4bcd4bdaef..319851b936 100644
+--- a/doc/src/sgml/ref/pg_dump.sgml
++++ b/doc/src/sgml/ref/pg_dump.sgml
+@@ -767,6 +767,34 @@ PostgreSQL documentation
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry>
++      <term><option>--include-foreign-data=<replaceable class="parameter">foreignserver</replaceable></option></term>
++      <listitem>
++       <para>
++        Dump the data for any foreign table with a foreign server
++        matching <replaceable class="parameter">foreignserver</replaceable>
++        pattern. Multiple foreign servers can be selected by writing multiple <option>--include-foreign-data</option>.
++        Also, the <replaceable class="parameter">foreignserver</replaceable> parameter is
++        interpreted as a pattern according to the same rules used by
++        <application>psql</application>'s <literal>\d</literal> commands (see <xref
++        linkend="app-psql-patterns" endterm="app-psql-patterns-title"/>),
++        so multiple foreign servers can also be selected by writing wildcard characters
++        in the pattern.  When using wildcards, be careful to quote the pattern
++        if needed to prevent the shell from expanding the wildcards;  see
++        <xref linkend="pg-dump-examples" endterm="pg-dump-examples-title"/>.
++        The only exception is that an empty pattern is disallowed.
++       </para>
++
++       <note>
++        <para>
++         When <option>--include-foreign-data</option> is specified, <application>pg_dump</application>
++         does not check if the foreign table is also writeable. Therefore, there is no guarantee that 
++         the results of a foreign table dump can be successfully restored by themselves into a clean database.
++        </para>
++       </note>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry>
+       <term><option>--inserts</option></term>
+       <listitem>
+diff --git a/src/bin/pg_dump/pg_backup.h b/src/bin/pg_dump/pg_backup.h
+index 8c0cedcd98..d255162c7a 100644
+--- a/src/bin/pg_dump/pg_backup.h
++++ b/src/bin/pg_dump/pg_backup.h
+@@ -141,6 +141,7 @@ typedef struct _dumpOptions
+ 	bool		aclsSkip;
+ 	const char *lockWaitTimeout;
+ 	int			dump_inserts;	/* 0 = COPY, otherwise rows per INSERT */
++	bool		include_foreign_data;
+ 
+ 	/* flags for various command-line long options */
+ 	int			disable_dollar_quoting;
+diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
+index 799b6988b7..13156357dd 100644
+--- a/src/bin/pg_dump/pg_dump.c
++++ b/src/bin/pg_dump/pg_dump.c
+@@ -120,6 +120,8 @@ static SimpleStringList table_exclude_patterns = {NULL, NULL};
+ static SimpleOidList table_exclude_oids = {NULL, NULL};
+ static SimpleStringList tabledata_exclude_patterns = {NULL, NULL};
+ static SimpleOidList tabledata_exclude_oids = {NULL, NULL};
++static SimpleStringList foreign_servers_include_patterns = {NULL, NULL};
++static SimpleOidList foreign_servers_include_oids = {NULL, NULL};
+ 
+ 
+ char		g_opaque_type[10];	/* name for the opaque type */
+@@ -156,6 +158,9 @@ static void expand_schema_name_patterns(Archive *fout,
+ 										SimpleStringList *patterns,
+ 										SimpleOidList *oids,
+ 										bool strict_names);
++static void expand_foreign_server_name_patterns(Archive *fout,
++										SimpleStringList *patterns,
++										SimpleOidList *oids);
+ static void expand_table_name_patterns(Archive *fout,
+ 									   SimpleStringList *patterns,
+ 									   SimpleOidList *oids,
+@@ -388,6 +393,7 @@ main(int argc, char **argv)
+ 		{"no-sync", no_argument, NULL, 7},
+ 		{"on-conflict-do-nothing", no_argument, &dopt.do_nothing, 1},
+ 		{"rows-per-insert", required_argument, NULL, 10},
++		{"include-foreign-data", required_argument, NULL, 11},
+ 
+ 		{NULL, 0, NULL, 0}
+ 	};
+@@ -604,6 +610,13 @@ main(int argc, char **argv)
+ 				dopt.dump_inserts = (int) rowsPerInsert;
+ 				break;
+ 
++			case 11:				/* include foreign data */
++				if (strcmp(optarg, "") == 0)
++					fatal("empty string is not a valid pattern in --include-foreign-data");
++				simple_string_list_append(&foreign_servers_include_patterns, optarg);
++				dopt.include_foreign_data = true;
++				break;
++
+ 			default:
+ 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+ 				exit_nicely(1);
+@@ -645,6 +658,12 @@ main(int argc, char **argv)
+ 		exit_nicely(1);
+ 	}
+ 
++	if (dopt.schemaOnly && foreign_servers_include_patterns.head != NULL)
++		fatal("options -s/--schema-only and --include-foreign-data cannot be used together");
++
++	if (numWorkers > 1 && foreign_servers_include_patterns.head != NULL)
++		fatal("option --include-foreign-data is not supported with parallel backup");
++
+ 	if (dopt.dataOnly && dopt.outputClean)
+ 	{
+ 		pg_log_error("options -c/--clean and -a/--data-only cannot be used together");
+@@ -812,6 +831,9 @@ main(int argc, char **argv)
+ 							   &tabledata_exclude_oids,
+ 							   false);
+ 
++	expand_foreign_server_name_patterns(fout, &foreign_servers_include_patterns,
++										&foreign_servers_include_oids);
++
+ 	/* non-matching exclusion patterns aren't an error */
+ 
+ 	/*
+@@ -1035,6 +1057,9 @@ help(const char *progname)
+ 	printf(_("  --use-set-session-authorization\n"
+ 			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
+ 			 "                               ALTER OWNER commands to set ownership\n"));
++	printf(_("  --include-foreign-data=PATTERN\n"
++			 "                               include data of foreign tables with the named\n"
++			 "                               foreign servers in dump\n"));
+ 
+ 	printf(_("\nConnection options:\n"));
+ 	printf(_("  -d, --dbname=DBNAME      database to dump\n"));
+@@ -1333,6 +1358,53 @@ expand_schema_name_patterns(Archive *fout,
+ 	destroyPQExpBuffer(query);
+ }
+ 
++/*
++ * Find the OIDs of all foreign servers matching the given list of patterns,
++ * and append them to the given OID list.
++ */
++static void
++expand_foreign_server_name_patterns(Archive *fout,
++							SimpleStringList *patterns,
++							SimpleOidList *oids)
++{
++	PQExpBuffer query;
++	PGresult   *res;
++	SimpleStringListCell *cell;
++	int			i;
++
++	if (patterns->head == NULL)
++		return;					/* nothing to do */
++
++	query = createPQExpBuffer();
++
++	/*
++	 * The loop below runs multiple SELECTs might sometimes result in
++	 * duplicate entries in the OID list, but we don't care.
++	 */
++
++	for (cell = patterns->head; cell; cell = cell->next)
++	{
++		appendPQExpBuffer(query,
++						  "SELECT oid FROM pg_catalog.pg_foreign_server s\n");
++		processSQLNamePattern(GetConnection(fout), query, cell->val, false,
++							  false, NULL, "s.srvname", NULL, NULL);
++
++		res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
++		if (PQntuples(res) == 0)
++			fatal("no matching foreign servers were found for pattern \"%s\"", cell->val);
++
++		for (i = 0; i < PQntuples(res); i++)
++		{
++			simple_oid_list_append(oids, atooid(PQgetvalue(res, i, 0)));
++		}
++
++		PQclear(res);
++		resetPQExpBuffer(query);
++	}
++
++	destroyPQExpBuffer(query);
++}
++
+ /*
+  * Find the OIDs of all tables matching the given list of patterns,
+  * and append them to the given OID list. See also expand_dbname_patterns()
+@@ -1809,7 +1881,11 @@ dumpTableData_copy(Archive *fout, void *dcontext)
+ 	 */
+ 	column_list = fmtCopyColumnList(tbinfo, clistBuf);
+ 
+-	if (tdinfo->filtercond)
++	/*
++	 * COPY TO does not support foreign tables directly, instead we do a
++	 * COPY (SELECT ...) TO.
++	 */
++	if (tdinfo->filtercond || tbinfo->relkind == RELKIND_FOREIGN_TABLE)
+ 	{
+ 		/* Note: this syntax is only supported in 8.2 and up */
+ 		appendPQExpBufferStr(q, "COPY (SELECT ");
+@@ -1821,9 +1897,11 @@ dumpTableData_copy(Archive *fout, void *dcontext)
+ 		}
+ 		else
+ 			appendPQExpBufferStr(q, "* ");
+-		appendPQExpBuffer(q, "FROM %s %s) TO stdout;",
+-						  fmtQualifiedDumpable(tbinfo),
+-						  tdinfo->filtercond);
++
++		appendPQExpBuffer(q, "FROM %s", fmtQualifiedDumpable(tbinfo));
++		if (tdinfo->filtercond)
++			appendPQExpBuffer(q, " %s", tdinfo->filtercond);
++		appendPQExpBuffer(q, ") TO stdout;");
+ 	}
+ 	else
+ 	{
+@@ -2339,8 +2417,11 @@ makeTableDataInfo(DumpOptions *dopt, TableInfo *tbinfo)
+ 	/* Skip VIEWs (no data to dump) */
+ 	if (tbinfo->relkind == RELKIND_VIEW)
+ 		return;
+-	/* Skip FOREIGN TABLEs (no data to dump) */
+-	if (tbinfo->relkind == RELKIND_FOREIGN_TABLE)
++	/* Skip FOREIGN TABLEs (no data to dump) if not requested explicitly */
++	if (tbinfo->relkind == RELKIND_FOREIGN_TABLE &&
++		(foreign_servers_include_oids.head == NULL ||
++		!simple_oid_list_member(&foreign_servers_include_oids,
++								tbinfo->foreign_server_oid)))
+ 		return;
+ 	/* Skip partitioned tables (data in partitions) */
+ 	if (tbinfo->relkind == RELKIND_PARTITIONED_TABLE)
+@@ -6648,6 +6729,25 @@ getTables(Archive *fout, int *numTables)
+ 		tblinfo[i].ispartition = (strcmp(PQgetvalue(res, i, i_ispartition), "t") == 0);
+ 		tblinfo[i].partbound = pg_strdup(PQgetvalue(res, i, i_partbound));
+ 
++		if (dopt->include_foreign_data &&
++			tblinfo[i].relkind == RELKIND_FOREIGN_TABLE)
++		{
++			PQExpBuffer query_server = createPQExpBuffer();
++			PGresult   *res_server;
++
++			/* retrieve the oid of the foreign server*/
++			appendPQExpBuffer(query_server,
++							  "SELECT ftserver "
++							  "FROM pg_catalog.pg_foreign_table "
++							  "WHERE ftrelid = '%u'",
++							  tblinfo[i].dobj.catId.oid);
++
++			res_server = ExecuteSqlQueryForSingleRow(fout, query_server->data);
++			tblinfo[i].foreign_server_oid = atooid(PQgetvalue(res_server, 0, 0));
++			PQclear(res_server);
++			destroyPQExpBuffer(query_server);
++		}
++
+ 		/*
+ 		 * Read-lock target tables to make sure they aren't DROPPED or altered
+ 		 * in schema before we get around to dumping them.
+diff --git a/src/bin/pg_dump/pg_dump.h b/src/bin/pg_dump/pg_dump.h
+index 21004e5078..caf4fa7946 100644
+--- a/src/bin/pg_dump/pg_dump.h
++++ b/src/bin/pg_dump/pg_dump.h
+@@ -322,6 +322,7 @@ typedef struct _tableInfo
+ 	char	   *partbound;		/* partition bound definition */
+ 	bool		needs_override; /* has GENERATED ALWAYS AS IDENTITY */
+ 	char	   *amname;			/* relation access method */
++	Oid			foreign_server_oid; /* foreign server oid */
+ 
+ 	/*
+ 	 * Stuff computed only for dumpable tables.
+diff --git a/src/bin/pg_dump/t/001_basic.pl b/src/bin/pg_dump/t/001_basic.pl
+index 9ca8a8e608..af56ad6183 100644
+--- a/src/bin/pg_dump/t/001_basic.pl
++++ b/src/bin/pg_dump/t/001_basic.pl
+@@ -4,7 +4,7 @@ use warnings;
+ use Config;
+ use PostgresNode;
+ use TestLib;
+-use Test::More tests => 74;
++use Test::More tests => 80;
+ 
+ my $tempdir       = TestLib::tempdir;
+ my $tempdir_short = TestLib::tempdir_short;
+@@ -49,6 +49,24 @@ command_fails_like(
+ 	'pg_dump: options -s/--schema-only and -a/--data-only cannot be used together'
+ );
+ 
++command_fails_like(
++	[ 'pg_dump', '-s', '--include-foreign-data', 'xxx' ],
++	qr/\Qpg_dump: error: options -s\/--schema-only and --include-foreign-data cannot be used together\E/,
++	'pg_dump: options -s/--schema-only and --include-foreign-data cannot be used together'
++);
++
++command_fails_like(
++	[ 'pg_dump', '-j2', '--include-foreign-data', 'xxx' ],
++	qr/\Qpg_dump: error: option --include-foreign-data is not supported with parallel backup\E/,
++	'pg_dump: option --include-foreign-data is not supported with parallel backup'
++);
++
++command_fails_like(
++	[ 'pg_dump', '--include-foreign-data', '' ],
++	qr/\Qpg_dump: error: empty string is not a valid pattern in --include-foreign-data\E/,
++	'pg_dump: empty string is not a valid pattern in --include-foreign-data'
++);
++
+ command_fails_like(
+ 	['pg_restore'],
+ 	qr{\Qpg_restore: error: one of -d/--dbname and -f/--file must be specified\E},
+diff --git a/src/test/modules/test_pg_dump/Makefile b/src/test/modules/test_pg_dump/Makefile
+index 6123b994f6..6f95a83b57 100644
+--- a/src/test/modules/test_pg_dump/Makefile
++++ b/src/test/modules/test_pg_dump/Makefile
+@@ -1,12 +1,12 @@
+ # src/test/modules/test_pg_dump/Makefile
+ 
+-MODULE = test_pg_dump
+-PGFILEDESC = "test_pg_dump - Test pg_dump with an extension"
++MODULES = test_pg_dump_fdw
++PGFILEDESC = "test_pg_dump - Test pg_dump with extensions"
+ 
+-EXTENSION = test_pg_dump
+-DATA = test_pg_dump--1.0.sql
++EXTENSION = test_pg_dump_fdw test_pg_dump
++DATA = test_pg_dump_fdw--1.0.sql test_pg_dump--1.0.sql
+ 
+-REGRESS = test_pg_dump
++REGRESS = test_pg_dump test_pg_dump_fdw
+ TAP_TESTS = 1
+ 
+ ifdef USE_PGXS
+diff --git a/src/test/modules/test_pg_dump/expected/test_pg_dump_fdw.out b/src/test/modules/test_pg_dump/expected/test_pg_dump_fdw.out
+new file mode 100644
+index 0000000000..dc1b6267ee
+--- /dev/null
++++ b/src/test/modules/test_pg_dump/expected/test_pg_dump_fdw.out
+@@ -0,0 +1,19 @@
++CREATE EXTENSION test_pg_dump_fdw;
++CREATE SERVER pg_dump_fdw FOREIGN DATA WRAPPER test_pg_dump_fdw;
++CREATE FOREIGN TABLE test_pg_dump_fdw_t (a INTEGER, b INTEGER) SERVER pg_dump_fdw;
++SELECT * FROM test_pg_dump_fdw_t;
++ a  | b  
++----+----
++  0 |  0
++  1 |  1
++  2 |  2
++  3 |  3
++  4 |  4
++  5 |  5
++  6 |  6
++  7 |  7
++  8 |  8
++  9 |  9
++ 10 | 10
++(11 rows)
++
+diff --git a/src/test/modules/test_pg_dump/sql/test_pg_dump_fdw.sql b/src/test/modules/test_pg_dump/sql/test_pg_dump_fdw.sql
+new file mode 100644
+index 0000000000..06ad1d51a0
+--- /dev/null
++++ b/src/test/modules/test_pg_dump/sql/test_pg_dump_fdw.sql
+@@ -0,0 +1,7 @@
++CREATE EXTENSION test_pg_dump_fdw;
++
++CREATE SERVER pg_dump_fdw FOREIGN DATA WRAPPER test_pg_dump_fdw;
++
++CREATE FOREIGN TABLE test_pg_dump_fdw_t (a INTEGER, b INTEGER) SERVER pg_dump_fdw;
++
++SELECT * FROM test_pg_dump_fdw_t;
+diff --git a/src/test/modules/test_pg_dump/t/001_base.pl b/src/test/modules/test_pg_dump/t/001_base.pl
+index fb4ecf8aca..6c57d39a56 100644
+--- a/src/test/modules/test_pg_dump/t/001_base.pl
++++ b/src/test/modules/test_pg_dump/t/001_base.pl
+@@ -135,6 +135,13 @@ my %pgdump_runs = (
+ 			"$tempdir/defaults_tar_format.tar",
+ 		],
+ 	},
++	include_foreign_data => {
++		dump_cmd => [
++			'pg_dump',
++			'--include-foreign-data=test_pg_dump_fdw_server',
++			"--file=$tempdir/include_foreign_data.sql",
++		],
++	},
+ 	pg_dumpall_globals => {
+ 		dump_cmd => [
+ 			'pg_dumpall',                             '--no-sync',
+@@ -220,6 +227,7 @@ my %full_runs = (
+ 	createdb        => 1,
+ 	defaults        => 1,
+ 	no_privs        => 1,
++	include_foreign_data => 1,
+ 	no_owner        => 1,);
+ 
+ my %tests = (
+@@ -537,6 +545,55 @@ my %tests = (
+ 			schema_only      => 1,
+ 			section_pre_data => 1,
+ 		},
++	},
++
++	'CREATE EXTENSION test_pg_dump_fdw' => {
++		create_order => 2,
++		create_sql   => 'CREATE EXTENSION test_pg_dump_fdw;',
++		regexp => qr/^
++			\QCREATE EXTENSION IF NOT EXISTS test_pg_dump_fdw WITH SCHEMA public;\E
++			\n/xm,
++		like => {
++			%full_runs,
++			include_foreign_data => 1,
++			schema_only => 1,
++			section_pre_data => 1,
++		},
++		unlike => { binary_upgrade => 1, },
++	},
++
++	'CREATE SERVER test_pg_dump_fdw_server FOREIGN DATA WRAPPER test_pg_dump_fdw' => {
++		create_order => 3,
++		create_sql   => 'CREATE SERVER test_pg_dump_fdw_server FOREIGN DATA WRAPPER test_pg_dump_fdw;',
++		regexp => qr/^
++			\QCREATE SERVER test_pg_dump_fdw_server FOREIGN DATA WRAPPER test_pg_dump_fdw;\E
++			\n/xm,
++		like => {
++			%full_runs,
++			include_foreign_data => 1,
++			schema_only => 1,
++			section_pre_data => 1,
++		},
++	},
++
++	'include foreign data' => {
++		create_order => 9,
++		create_sql => 'CREATE FOREIGN TABLE t (a INTEGER, b INTEGER) SERVER test_pg_dump_fdw_server;',
++		regexp => qr/^
++			\QCOPY public.t (a, b) FROM stdin;\E\n
++			\Q0	0\E\n
++			\Q1	1\E\n
++			\Q2	2\E\n
++			\Q3	3\E\n
++			\Q4	4\E\n
++			\Q5	5\E\n
++			\Q6	6\E\n
++			\Q7	7\E\n
++			\Q8	8\E\n
++			\Q9	9\E\n
++			\Q10	10\E\n
++			/xm,
++		like => { include_foreign_data => 1, },
+ 	},);
+ 
+ #########################################
+diff --git a/src/test/modules/test_pg_dump/test_pg_dump_fdw--1.0.sql b/src/test/modules/test_pg_dump/test_pg_dump_fdw--1.0.sql
+new file mode 100644
+index 0000000000..88931393d0
+--- /dev/null
++++ b/src/test/modules/test_pg_dump/test_pg_dump_fdw--1.0.sql
+@@ -0,0 +1,9 @@
++\echo Use "CREATE EXTENSION test_pg_dump_fdw" to load this file. \quit
++
++CREATE FUNCTION test_pg_dump_fdw_handler()
++RETURNS fdw_handler
++AS 'MODULE_PATHNAME'
++LANGUAGE C STRICT;
++
++CREATE FOREIGN DATA WRAPPER test_pg_dump_fdw
++HANDLER test_pg_dump_fdw_handler;
+diff --git a/src/test/modules/test_pg_dump/test_pg_dump_fdw.c b/src/test/modules/test_pg_dump/test_pg_dump_fdw.c
+new file mode 100644
+index 0000000000..72e4c01ea8
+--- /dev/null
++++ b/src/test/modules/test_pg_dump/test_pg_dump_fdw.c
+@@ -0,0 +1,155 @@
++#include "postgres.h"
++
++#include "catalog/pg_type.h"
++#include "foreign/fdwapi.h"
++#include "foreign/foreign.h"
++#include "optimizer/pathnode.h"
++#include "optimizer/planmain.h"
++#include "optimizer/restrictinfo.h"
++
++static int curr_row = 0;
++
++PG_MODULE_MAGIC;
++
++PG_FUNCTION_INFO_V1(test_pg_dump_fdw_handler);
++
++static void dumptestGetForeignRelSize(PlannerInfo *root,
++									  RelOptInfo *baserel,
++									  Oid foreigntableid);
++static void dumptestGetForeignPaths(PlannerInfo *root,
++									RelOptInfo *baserel,
++									Oid foreigntableid);
++static ForeignScan * dumptestGetForeignPlan(PlannerInfo *root,
++								   RelOptInfo *baserel,
++								   Oid foreigntableid,
++								   ForeignPath *best_path,
++								   List *tlist,
++								   List *scan_clauses,
++								   Plan *outer_plan);
++static void dumptestBeginForeignScan(ForeignScanState *node,
++									 int eflags);
++static TupleTableSlot * dumptestIterateForeignScan(ForeignScanState *node);
++static void dumptestReScanForeignScan(ForeignScanState *node);
++static void dumptestEndForeignScan(ForeignScanState *node);
++
++/*
++ * Handler function
++ */
++Datum
++test_pg_dump_fdw_handler(PG_FUNCTION_ARGS)
++{
++	FdwRoutine *fdwroutine = makeNode(FdwRoutine);
++
++	fdwroutine->GetForeignRelSize = dumptestGetForeignRelSize;
++	fdwroutine->GetForeignPaths = dumptestGetForeignPaths;
++	fdwroutine->GetForeignPlan = dumptestGetForeignPlan;
++	fdwroutine->BeginForeignScan = dumptestBeginForeignScan;
++	fdwroutine->IterateForeignScan = dumptestIterateForeignScan;
++	fdwroutine->ReScanForeignScan = dumptestReScanForeignScan;
++	fdwroutine->EndForeignScan = dumptestEndForeignScan;
++
++	PG_RETURN_POINTER(fdwroutine);
++}
++
++static void
++dumptestGetForeignRelSize(PlannerInfo *root,
++						  RelOptInfo *baserel,
++						  Oid foreigntableid)
++{
++	baserel->rows = 1;
++}
++
++static void
++dumptestGetForeignPaths(PlannerInfo *root,
++						RelOptInfo *baserel,
++						Oid foreigntableid)
++{
++	add_path(baserel, (Path *)
++			 create_foreignscan_path(root, baserel,
++			 						 NULL /* default pathtarget */,
++									 baserel->rows,
++									 1,
++									 1,
++									 NIL,
++									 baserel->lateral_relids,
++									 NULL,
++									 NIL));
++}
++
++static ForeignScan *
++dumptestGetForeignPlan(PlannerInfo *root,
++					   RelOptInfo *baserel,
++					   Oid foreigntableid,
++					   ForeignPath *best_path,
++					   List *tlist,
++					   List *scan_clauses,
++					   Plan *outer_plan)
++{
++	scan_clauses = extract_actual_clauses(scan_clauses, false);
++	
++	return make_foreignscan(tlist,
++							scan_clauses,
++							baserel->relid,
++							NIL,
++							best_path->fdw_private,
++							NIL,
++							NIL,
++							outer_plan);
++}
++
++static void
++dumptestBeginForeignScan(ForeignScanState *node, int eflags)
++{
++	TupleDesc		desc;
++
++	desc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
++
++	for (int i = 0; i < desc->natts; i++)
++	{
++		if (desc->attrs[i].atttypid != INT4OID)
++			ereport(ERROR,
++					(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
++					 errmsg("test_pg_dump_fdw only supports INT4 columns")));
++	}
++}
++
++static TupleTableSlot *
++dumptestIterateForeignScan(ForeignScanState *node)
++{
++	TupleTableSlot *slot;
++	TupleDesc		desc;
++
++	/* limit the testcase to contain 10 rows */
++	if (curr_row > 10)
++		return NULL;
++
++	slot = node->ss.ss_ScanTupleSlot;
++	desc = slot->tts_tupleDescriptor;
++
++	ExecClearTuple(slot);
++	
++	for (int i = 0; i < desc->natts; i++)
++	{
++		slot->tts_isnull[i] = false;
++		slot->tts_values[i] = Int32GetDatum(curr_row);
++	}
++
++	ExecStoreVirtualTuple(slot);
++	curr_row++;
++
++	return slot;
++}
++
++static void
++dumptestReScanForeignScan(ForeignScanState *node)
++{
++	(void) node;
++	curr_row = 0;
++}
++
++static void
++dumptestEndForeignScan(ForeignScanState *node)
++{
++	(void) node;
++	curr_row = 0;
++}
+diff --git a/src/test/modules/test_pg_dump/test_pg_dump_fdw.control b/src/test/modules/test_pg_dump/test_pg_dump_fdw.control
+new file mode 100644
+index 0000000000..cc4a37c441
+--- /dev/null
++++ b/src/test/modules/test_pg_dump/test_pg_dump_fdw.control
+@@ -0,0 +1,5 @@
++# test_pg_dump_fdw
++comment = 'hardcoded foreign-data wrapper for testing dumping foreign data'
++default_version = '1.0'
++module_pathname = '$libdir/test_pg_dump_fdw'
++relocatable = true
